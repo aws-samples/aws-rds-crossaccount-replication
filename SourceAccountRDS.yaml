@@ -1,0 +1,555 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: Yaml template for sync Aurora database from database from different account. 
+Parameters:
+#general params 
+
+  SourceDBIdentifier:  
+    Description: Name of existing RDS cluster
+    Type: String
+    Default: 'source-database-1'
+
+  KMSKey:
+    Description: Arn of Cross Account KMS Key that is shared with destination account
+    Type: String 
+    Default: 'arn:aws:kms:us-east-1:299344511603:key/45aaac81-ccfa-4c4b-b197-95fe6c40c93a'
+  
+  SourceDBSnapshotName:
+    Description: Name of the Snapshot
+    Type: String
+    Default: 'source-database-snapshot'
+  
+  DestinationAccountNumber: 
+    Description: Destination Account Number 
+    Type: String
+    Default: 285731477250
+  
+  ScheduleExpression:
+    Type: String 
+    Description: Schedule expressions using cron
+    Default: cron(0 * * * ? *)
+
+Resources: 
+#Role that lambda will assume in source account  
+  LambdaSourceAccountRole: 
+    Type: AWS::IAM::Role 
+    Properties: 
+      RoleName: !Sub ${AWS::StackName}-LambdaSourceAccountRole
+      Path: / 
+      AssumeRolePolicyDocument:               
+          Version: '2012-10-17' 
+          Statement: 
+          - Sid: 'LambdaSSMAssume' 
+            Effect: Allow 
+            Principal: 
+              Service: 
+              - lambda.amazonaws.com   
+            Action: sts:AssumeRole
+            
+  RDSReplicationPolicySourceAccount: 
+    Type: AWS::IAM::Policy
+    Properties: 
+      PolicyName: !Sub ${AWS::StackName}-RDSReplicationPolicySourceAccount 
+      PolicyDocument: 
+        Statement: 
+        - Action: ["logs:DescribeLogStreams", "logs:CreateLogStream", "logs:PutLogEvents", "logs:CreateLogGroup"] 
+          Resource: "*"  
+          Effect: Allow         
+        - Action: ["rds:CreateDBSnapshot","rds:DescribeDBInstances","rds:CopyDBSnapshot","rds:DeleteDBSnapshot","rds:ModifyDBSnapshotAttribute","rds:DescribeDBSnapshots"]
+          Resource: "*" 
+          Effect: Allow
+        - Action: ["KMS:Decrypt","KMS:DescribeKey","KMS:Encrypt","KMS:GenerateDataKey","KMS:ReEncryptFrom","KMS:ReEncryptTo","KMS:CreateGrant"]
+          Resource: "*" 
+          Effect: Allow
+      Roles: [!Ref LambdaSourceAccountRole]
+       
+
+# Step 1:  Snapshot creation in source account. Remember that this function only work with Aurora DB clusters.
+  CreateLatestSnapshot:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-CreateLatestSnapshot
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: | 
+          import boto3
+          import os
+
+          rds = boto3.client('rds')
+          db_identifier = os.environ.get("SourceDBIdentifier")
+          db_snapshot_identifier = os.environ.get("db_snapshot_identifier")
+
+          def delete_latest_snapshot():
+              
+              print('Deleting existing snapshot...')
+              try:
+                  response = rds.delete_db_snapshot(
+                        DBSnapshotIdentifier=db_snapshot_identifier
+                  )
+                  print('response >> ',response)
+              except Exception as e:
+                  print(e)    
+                
+          def create_latest_snapshot():
+              print('Creating Snapshot...')
+              try:
+                  response = rds.create_db_snapshot(DBSnapshotIdentifier=db_snapshot_identifier,
+                                              DBInstanceIdentifier=db_identifier)
+                  print('response >> ',response)
+                  print('SourceDBSnapshotArn >> ',response['DBSnapshot']['DBSnapshotArn'])
+                  
+                  return {
+                  'SourceDBSnapshot': {
+                      'SourceDBSnapshotArn': response['DBSnapshot']['DBSnapshotArn']
+                      }
+                  }
+                                    
+              except Exception as e:
+                  print(e)  
+
+          def lambda_handler(event, context):
+              #Delete the existing snapshot
+              delete_latest_snapshot()
+              #To Create a latest snapshot
+              response = create_latest_snapshot()
+              print('final response >>><<<', response)
+              return response
+      Description: 'To Create a Snapshot in source account'
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt LambdaSourceAccountRole.Arn
+      Environment: 
+        Variables: 
+          SourceDBIdentifier: !Ref SourceDBIdentifier
+          db_snapshot_identifier: !Ref SourceDBSnapshotName
+      Tags: 
+            - 
+              Key: "ProjectName"
+              Value: "SyncInstanceCrossAccount"  
+#Cloud Watch config       
+  CreateLatestSnapshotLogGroup:
+      Type: "AWS::Logs::LogGroup"
+      Properties:
+        RetentionInDays: 120
+        LogGroupName: !Join ["", ["/aws/lambda/", !Ref CreateLatestSnapshot]]
+
+
+# Step 2:  CheckSnapshotStatus       
+# To check the snapshot status.
+  CheckSnapshotStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-CheckSnapshotStatus
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from operator import itemgetter
+
+          rds = boto3.client('rds')
+
+          def lambda_handler(event, context):
+              print('FetchRDSSnapshotStatus function Event: {}'.format(event))
+              dbSnapshotIdentifier = event['SourceDBSnapshot']['SourceDBSnapshotArn']
+              print('dbSnapshotIdentifier::', dbSnapshotIdentifier)
+              output =     {
+                  'SourceDBSnapshot': {
+                      'SourceDBSnapshotArn': dbSnapshotIdentifier,
+                      'status':'NotAvailable'
+                    }
+                  }
+
+              try:
+
+                  response = rds.describe_db_snapshots(
+                      DBSnapshotIdentifier=dbSnapshotIdentifier
+                  )
+                  print("Response >> ",response)
+                  
+                  if not response['DBSnapshots']:
+                      return output
+                      
+                  if len(response['DBSnapshots'])>1:
+                      sorted_keys = sorted(response['DBSnapshots'], key=itemgetter('SnapshotCreateTime'), reverse=True)
+                      status = sorted_keys[0]['Status']  
+                  else:
+                      status = response['DBSnapshots'][0]['Status'] 
+                  
+                  print('status:', status)    
+                      
+                  if status == 'available':
+                      return  {
+                          'SourceDBSnapshot': {
+                              'SourceDBSnapshotArn': dbSnapshotIdentifier,
+                              'status':'Available'
+                              }
+                          }                    
+                  else:
+                      return output
+                  
+              except Exception as e:
+                  print("error: {0}".format(e))
+                  return {'status':'NotAvailable'}              
+      MemorySize: 128
+      Timeout: 100
+      Role: !GetAtt LambdaSourceAccountRole.Arn
+      Tags: 
+            - 
+              Key: "ProjectName"
+              Value: "SyncInstanceCrossAccount"   
+#Cloud Watch config        
+  CheckSnapshotStatusLogGroup:
+      Type: "AWS::Logs::LogGroup"
+      Properties:
+        RetentionInDays: 120
+        LogGroupName: !Join ["", ["/aws/lambda/", !Ref CheckSnapshotStatus]]
+
+# Step 3:  Encrypt Snapshot           
+#To copy snapshot after the encryption with AWS KMS keys.
+  CopyEncryptSnapshot:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-CopyEncryptSnapshot
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          
+          kms_key=os.environ.get("kms_key")
+          target_db_snapshot_identifier = os.environ.get("db_snapshot_identifier")+'-copy-in-'+target_region 
+          
+          rds = boto3.client('rds')     
+
+          def delete_existing_snapshot():
+              print('Deleting Existing Snapshot')
+              try:
+                  response = rds.delete_db_snapshot(
+                      DBSnapshotIdentifier=target_db_snapshot_identifier
+                  )
+                  print("Response >> ",response)
+              except Exception as e:
+                  print(e)    
+              
+          def copy_latest_snapshot(dbSnapshotIdentifier):
+              #To copy the RDS
+              
+              print('source_db_snapshot_identifier ::', dbSnapshotIdentifier)
+              print('Copying Latest Snapshot')
+              try:
+                  response = rds.copy_db_snapshot(SourceDBSnapshotIdentifier=dbSnapshotIdentifier,
+                                              KmsKeyId=kms_key,
+                                              TargetDBSnapshotIdentifier=target_db_snapshot_identifier,
+                                              SourceRegion=boto3.session.Session().region_name)
+                  print("Response >> ",response)
+                  print('TargetDBSnapshotArn >> ',response['DBSnapshot']['DBSnapshotArn'])
+                  return {
+                    'targetDBSnapshot': {
+                        'targetDBSnapshotIdentifier': response['DBSnapshot']['DBSnapshotIdentifier']
+                        }
+                }
+              except Exception as e:
+                  print(e)
+
+          def lambda_handler(event, context):
+              #Delete Existing Snapshot
+              delete_existing_snapshot()
+              
+              #Copy latest snapshot as automated snapshots can't be copied to other account
+              dbSnapshotIdentifier = event['SourceDBSnapshot']['SourceDBSnapshotArn']
+              response = copy_latest_snapshot(dbSnapshotIdentifier)
+              print('final response >>><<<', response)
+              return response
+      Description: 'To Encrypt the Snapshot'
+      MemorySize: 128
+      Timeout: 100
+      Role: !GetAtt LambdaSourceAccountRole.Arn
+      Environment: 
+        Variables:          
+          kms_key: !Ref KMSKey
+          db_snapshot_identifier: !Ref SourceDBSnapshotName         
+      Tags: 
+            - 
+              Key: "ProjectName"
+              Value: "SyncInstanceCrossAccount" 
+
+
+# Step 4:  DescribeCopyEncryptSnapshotStatus   
+#This option fetches the copy snapshot status and passes the response to IsCopyEncryptSnapshotAvailable method
+  DescribeCopyEncryptSnapshotStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}DescribeCopyEncryptSnapshotStatus
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from operator import itemgetter
+ 
+          rds = boto3.client('rds')          
+          def lambda_handler(event, context):
+              try:
+                  print('FetchRDSSnapshotStatus function Event: {}'.format(event))
+                  targetDBSnapshotIdentifier = event['targetDBSnapshot']['targetDBSnapshotIdentifier']
+                  print('targetdbSnapshotIdentifier::', targetDBSnapshotIdentifier)
+                  output =     {
+                      'targetDBSnapshot': {
+                          'targetDBSnapshotIdentifier': targetDBSnapshotIdentifier,
+                          'status':'NotAvailable'
+                        }
+                      }
+                  
+                  response = rds.describe_db_snapshots(
+                      DBSnapshotIdentifier=targetDBSnapshotIdentifier
+                  )
+                  print("Response >> ",response)
+
+                  if not response['DBSnapshots']:
+                      return output
+                      
+                  if len(response['DBSnapshots'])>1:
+                      sorted_keys = sorted(response['DBSnapshots'], key=itemgetter('SnapshotCreateTime'), reverse=True)
+                      status = sorted_keys[0]['Status'] 
+                      targetDBSnapshotArn = sorted_keys[0]['DBSnapshotArn']
+                  else:
+                      status = response['DBSnapshots'][0]['Status'] 
+                      targetDBSnapshotArn = response['DBSnapshots'][0]['DBSnapshotArn']
+
+                  if status == 'available':
+                      return  {
+                          'targetDBSnapshot': {
+                              'targetDBSnapshotIdentifier': targetDBSnapshotIdentifier,
+                              'targetDBSnapshotArn': targetDBSnapshotArn,
+                              'status':'Available'
+                              }
+                          }
+                  else:
+                      return output
+              except Exception as e:
+                  print("error: {0}".format(e))
+                  return {'status':'NotAvailable'}
+      Description: 'To Fetch the encrypted copied snapshot status'
+      MemorySize: 128
+      Timeout: 100
+      Role: !GetAtt LambdaSourceAccountRole.Arn
+      Tags: 
+            - 
+              Key: "ProjectName"
+              Value: "SyncInstanceCrossAccount" 
+ 
+
+# Step 5:  RDSShareSnapshot   
+#To share the copied snapshot with target AWS account.  
+  RDSShareSnapshot:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}RDSShareSnapshot
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+
+          rds = boto3.client('rds')    
+          shared_account = os.environ.get("shared_account")
+
+          def lambda_handler(event, context):
+              #To Share the snapshot with other account
+              print('FetchRDSSnapshotStatus function Event: {}'.format(event))
+              targetdbSnapshotIdentifier = event['targetDBSnapshot']['targetDBSnapshotIdentifier']
+              print('targetdbSnapshotIdentifier::', targetdbSnapshotIdentifier)
+              
+              print('shared_account::', shared_account)
+                            
+                            
+              response = rds.modify_db_snapshot_attribute(DBSnapshotIdentifier=targetdbSnapshotIdentifier,
+                                                          AttributeName="restore",
+                                                          ValuesToAdd=[shared_account])
+                                                          
+              print('response::', response)
+              return event                                           
+
+      Description: 'To Share the snapshot with target AWS account'
+      MemorySize: 128
+      Timeout: 100
+      Role: !GetAtt LambdaSourceAccountRole.Arn
+      Environment: 
+        Variables: 
+          shared_account: !Ref DestinationAccountNumber
+      Tags: 
+            - 
+              Key: "ProjectName"
+              Value: "SyncInstanceCrossAccount" 
+
+
+#SNS Topic for Cross Account Notification
+  CrossAccountSnapshotNotificationSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-CrossAccountSnapshotNotificationSNSTopic
+
+  SnapshotSchedulerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+                - states.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: InvokeCloudWatchEvent
+          PolicyDocument:
+            Statement:
+              - Action: ["states:startexecution"] 
+                Resource: "*"  
+                Effect: Allow
+              - Effect: Allow
+                Action:
+                  - "events:DescribeRule"
+                Resource:
+                  - "*"                
+
+  StepFunctionLambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-StepFunctionLambdaExecutionRole 
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: InvokeCallbackLambda
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref CrossAccountSnapshotNotificationSNSTopic
+                
+
+  CrossAccountRDSSnapshotWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+        StateMachineName: !Sub ${AWS::StackName}-Cross_Account_RDSSync-SourceAccount
+        DefinitionString:
+          !Sub
+            - |-
+              {
+                "StartAt": "CreateLatestSnapshot",
+                "States": {
+                  "CreateLatestSnapshot": {
+                    "Type": "Task",
+                    "Resource": "${CreateLatestSnapshot.Arn}",
+                    "Next": "CheckSnapshotStatus"
+                  },
+                  "CheckSnapshotStatus": {
+                    "Type": "Task",
+                    "Resource": "${CheckSnapshotStatus.Arn}",
+                    "Next": "IsSnapshotAvailable"
+                  },
+                  "IsSnapshotAvailable": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.SourceDBSnapshot.status",
+                        "StringEquals": "Available",
+                        "Next": "CopyEncryptedSnapshot"
+                      },
+                      {
+                        "Variable": "$.SourceDBSnapshot.status",
+                        "StringEquals": "NotAvailable",
+                        "Next": "WaitXMins"
+                      }
+                    ]
+                  },
+                  "WaitXMins": {
+                    "Type": "Wait",
+                    "Seconds": 240,
+                    "Next": "CheckSnapshotStatus"
+                  },
+                  "CopyEncryptedSnapshot": {
+                    "Type": "Task",
+                    "Resource": "${CopyEncryptSnapshot.Arn}",
+                    "Next": "TargetRDSSnapshotStatus"
+                  },
+                  "TargetRDSSnapshotStatus": {
+                    "Type": "Task",
+                    "Resource": "${DescribeCopyEncryptSnapshotStatus.Arn}", 
+                    "Next": "IsEncryptSnapshotAvailable"
+                  },
+                  "IsEncryptSnapshotAvailable": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.targetDBSnapshot.status",
+                        "StringEquals": "Available",
+                        "Next": "ShareStatusWithTargetAccount"
+                      },
+                      {
+                        "Variable": "$.targetDBSnapshot.status",
+                        "StringEquals": "NotAvailable",
+                        "Next": "WaitXMinsForTargetSnapshot"
+                      }
+                    ]
+                  },
+                  "WaitXMinsForTargetSnapshot": {
+                    "Type": "Wait",
+                    "Seconds": 180,
+                    "Next": "TargetRDSSnapshotStatus"
+                  },
+                  "ShareStatusWithTargetAccount": {
+                    "Type": "Task",
+                    "Resource": "${RDSShareSnapshot.Arn}", 
+                    "Next": "NotifyToTargetAccount"
+                  },
+                  "NotifyToTargetAccount": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::sns:publish",
+                    "Parameters": {
+                      "Message": {
+                        "Input.$": "$"
+                      },
+                      "TopicArn": "${CrossAccountSnapshotNotificationSNSTopic}"                      
+                    },
+                    "End": true
+                  }
+                }
+              }    
+            - {RDSUpScaleLambdaArn: !GetAtt [ RDSShareSnapshot, Arn ]}
+        RoleArn: !GetAtt StepFunctionLambdaExecutionRole.Arn
+
+  CrossAccountRDSSnapshotScheduler:
+    Type: AWS::Events::Rule
+    Properties:
+        Description: To Trigger the Step Function for Snapshot creation
+        Name: !Sub ${AWS::StackName}-SourceAccountRDSSnapshotScheduler
+        RoleArn: !GetAtt SnapshotSchedulerRole.Arn
+        ScheduleExpression: !Ref ScheduleExpression
+        State: ENABLED
+        Targets: 
+            - 
+                Arn: !Ref CrossAccountRDSSnapshotWorkflow
+                Id: "TargetFunctionV1"
+                RoleArn: !GetAtt SnapshotSchedulerRole.Arn        

@@ -1,0 +1,911 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: Yaml template for DB Instance creation from snapshot.
+Parameters:
+# General params 
+
+  Engine:
+    Type: String
+    Description: Engine Type
+    Default: 'postgres'
+
+  DBInstanceClass:
+    Type: String
+    Description: DB Instance Class
+    Default: 'db.m6i.large'
+
+  Subnetgroups:
+    Type: String 
+    Description: VPC SubnetGroups where RDS will be restored in
+    Default: "rds-xxx-xxxxxx"
+
+  DatabaseName:
+    Type: String 
+    Description: Name of the database in this account.  
+    Default: "rds-restored-db"
+
+  SecretName:
+    Type: String 
+    Description: Secret where DB details will be stored.  
+    Default: "dev/db/read"
+
+  SGID:
+    Type: String 
+    Description: Security group for destination cluster. Please ensure that port 5432 open     
+    Default: "sg-xxxxxxxxxxxxx"   
+
+  KMSKey:
+    Description: Arn of KMS Key to encrypt your snapshot in destination account. Check Pre-requisite 4.
+    Type: String 
+    Default: 'arn:aws:kms:us-east-1:1111111111111:key/e575ff8f-47a0-4b1e-ab03-5999f287a1af'
+
+  NoOfOlderInstances:
+    Description: Number of older instances that you want to keep for roll back
+    Type: Number 
+    Default: 2
+    
+Resources: 
+# Lambda execution role config   
+  LambdaTargetAccountRole: 
+    Type: AWS::IAM::Role 
+    Properties: 
+      RoleName: !Sub ${AWS::StackName}-LambdaTargetAccountRole
+      Path: / 
+      AssumeRolePolicyDocument:               
+          Version: '2012-10-17' 
+          Statement: 
+          - Sid: 'LambdaSSMAssume' 
+            Effect: Allow 
+            Principal: 
+              Service: 
+              - lambda.amazonaws.com   
+            Action: sts:AssumeRole
+            
+  DBReplicationPolicyTargetAccount: 
+    Type: AWS::IAM::Policy
+    Properties: 
+      PolicyName: DBReplicationPolicyTargetAccount 
+      PolicyDocument: 
+        Statement: 
+        - Action: ["logs:DescribeLogStreams", "logs:CreateLogStream", "logs:PutLogEvents", "logs:CreateLogGroup"] 
+          Resource: "*"  
+          Effect: Allow         
+        - Action: ["rds:RestoreDBInstanceFromDBSnapshot","rds:CreateDBInstance","rds:DescribeDBInstances","rds:ModifyDBInstance","rds:DeleteDBInstance","rds:DeleteDBSnapshot","rds:DescribeDBSnapshots","rds:CopyDBSnapshot","rds:AddTagsToResource"]
+          Resource: "*" 
+          Effect: Allow
+        - Action: ["KMS:Decrypt","KMS:DescribeKey","KMS:Encrypt", "KMS:GenerateDataKey","KMS:ReEncryptFrom","KMS:ReEncryptTo","KMS:CreateGrant"]
+          Resource: "*" 
+          Effect: Allow  
+        - Action: ["secretsmanager:GetResourcePolicy","secretsmanager:GetSecretValue","secretsmanager:DescribeSecret","secretsmanager:ListSecretVersionIds","secretsmanager:UpdateSecret"]
+          Resource: "*" 
+          Effect: Allow 
+        - Action: ["tag:GetResources"]
+          Resource: "*" 
+          Effect: Allow
+      Roles: [!Ref LambdaTargetAccountRole]
+
+# Lambda execution role config   
+  InvokeStepFunctionLambdaRole: 
+    Type: AWS::IAM::Role 
+    Properties: 
+      RoleName: !Sub ${AWS::StackName}-InvokeStepFunctionLambdaRole
+      Path: / 
+      AssumeRolePolicyDocument:               
+          Version: '2012-10-17' 
+          Statement: 
+          - Sid: 'LambdaSSMAssume' 
+            Effect: Allow 
+            Principal: 
+              Service: 
+              - lambda.amazonaws.com   
+            Action: sts:AssumeRole
+            
+  InvokeStepFunctionLambdaPolicy: 
+    Type: AWS::IAM::Policy
+    Properties: 
+      PolicyName: InvokeStepFunctionLambdaPolicy 
+      PolicyDocument: 
+        Statement: 
+        - Action: ["states:*"] 
+          Resource: "*"  
+          Effect: Allow 
+        - Action: ["logs:DescribeLogStreams", "logs:CreateLogStream", "logs:PutLogEvents", "logs:CreateLogGroup"] 
+          Resource: "*"  
+          Effect: Allow                     
+      Roles: [!Ref InvokeStepFunctionLambdaRole]
+
+  DevDBBSecret:
+    Type: AWS::SecretsManager::Secret
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    Properties:
+      Name: !Ref SecretName
+      Description: "For storing DB name and prefix"
+      SecretString: '{"db_host": "", "db_prefix": ""}'
+    
+
+# Step 1:  InvokeStepFunction        
+# This Lambda function will invoke Step Function workflow.
+  InvokeStepFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-InvokeStepFunction
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          client = boto3.client('stepfunctions')
+          stepfunctionArn = os.environ.get("stepfunctionArn")       
+          def lambda_handler(event, context):
+              try:                  
+                  print('FetchCrossAccount Event: {}'.format(event))                  
+                  sns_data = event['Records'][0]['Sns']['Message']          
+                  print('Input : ', sns_data)
+                  
+                  response = client.start_execution(
+                      stateMachineArn=stepfunctionArn,    
+                      input=  sns_data ,
+                      traceHeader='string'
+                      )
+                  
+                  print("Response >> ",response)                  
+              except Exception as e:
+                  print("error: {0}".format(e))
+
+      Description: 'This Lambda function will invoke Step Function workflow.'
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt InvokeStepFunctionLambdaRole.Arn 
+      Environment: 
+        Variables: 
+          stepfunctionArn : !Ref TargetAccountTargetRegionRDSRestoreWorkflow 
+
+# Step 2:  CheckSourceSnapshotStatus        
+#To make a copy of the shared cross account snapshot the snapshot status and pass the response to next stage.
+  CheckSourceSnapshotStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-CheckSourceSnapshotStatus
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from operator import itemgetter
+
+          rds = boto3.client('rds')
+          def lambda_handler(event, context):
+              try:
+                  print('FetchCrossAccount Event: {}'.format(event))
+                  dbSnapshotIdentifier = event['Input']['targetDBSnapshot']['targetDBSnapshotIdentifier']
+                  dbSnapshotArn = event['Input']['targetDBSnapshot']['targetDBSnapshotArn']
+
+                  print('dbSnapshotIdentifier::', dbSnapshotIdentifier)
+                  
+                  output = {
+                            'DBSnapshots': {
+                                'TargetDBSnapshotArn': dbSnapshotArn,
+                                'TargetDBSnapshotIdentifier': dbSnapshotIdentifier,
+                                'status':'NotAvailable'
+                              }
+                            }
+
+                  response = rds.describe_db_snapshots(
+                      DBSnapshotIdentifier=dbSnapshotArn,
+                      IncludeShared=True,
+                      SnapshotType="shared",
+                  )
+                  print("Response >> ",response)
+                  
+                  if not response['DBSnapshots']:
+                      return output
+
+                  sorted_keys = sorted(response['DBSnapshots'], key=itemgetter('SnapshotCreateTime'), reverse=True)
+                  status = sorted_keys[0]['Status']
+                  print('status::',status)
+                      
+                  if status == 'available':
+                      return {
+                            'DBSnapshot': {
+                                'TargetDBSnapshotArn': dbSnapshotArn,
+                                'TargetDBSnapshotIdentifier': dbSnapshotIdentifier,
+                                'status':'Available'
+                              }
+                            }
+
+                  else:
+                      return output
+                  
+              except Exception as e:
+                  print("error: {0}".format(e))
+                  return {'status':'NotAvailable'}
+
+      Description: 'To make a copy of the shared cross account snapshot the snapshot status and pass the response to next stage.'
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt LambdaTargetAccountRole.Arn 
+
+# Step 4:  CopySharedSnapshot        
+#To make a copy of the shared cross account snapshot 
+  CopySharedSnapshot:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-CopySharedSnapshot
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from operator import itemgetter
+
+          rds = boto3.client('rds')
+          kms_key=os.environ.get("kms_key")
+          def delete_existing_snapshot(target_db_snapshot_identifier):
+              print('Deleting Existing Snapshot')
+              try:
+                  response = rds.delete_db_snapshot(
+                      DBSnapshotIdentifier=target_db_snapshot_identifier
+                  )
+                  print("Response >> ",response)
+              except Exception as e:
+                  print(e)    
+          def copy_shared_snapshot(targetDBSnapshotIdentifier, sourceDBSnapshotIdentifier):
+              output = {
+                'DBSnapshot': {
+                  'TargetDBSnapshotIdentifier': targetDBSnapshotIdentifier,
+                  'status':'NotAvailable'
+                  }           
+                }
+              response = rds.copy_db_snapshot(
+                SourceDBSnapshotIdentifier=sourceDBSnapshotIdentifier,
+                TargetDBSnapshotIdentifier=targetDBSnapshotIdentifier,
+                KmsKeyId=kms_key
+              )
+              print("Response >> ",response)
+              if not response['DBSnapshot']:
+                return output
+
+              status = response['DBSnapshot']['Status']
+              print('status::',status)
+            
+              if status == 'available':
+                return {
+                  'DBSnapshot': {
+                  'TargetDBSnapshotIdentifier': targetDBSnapshotIdentifier,
+                  'status':'Available'
+                  }
+                }
+              else:
+                return output
+
+          def lambda_handler(event, context):
+              try:
+                  print('CopySharedRDSSnapshot Event: {}'.format(event))                
+                  sourceDBSnapshotIdentifier = event['DBSnapshot']['TargetDBSnapshotArn']
+                  targetDBSnapshotIdentifier="snapshotcopyin"+"-target"
+                  delete_existing_snapshot(targetDBSnapshotIdentifier)
+                  return copy_shared_snapshot(targetDBSnapshotIdentifier,sourceDBSnapshotIdentifier)
+                  
+              except Exception as e:
+                  print("error: {0}".format(e))
+                  return {'status':'NotAvailable'}
+
+      Description: 'To make a copy of the shared cross account snapshot '
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt LambdaTargetAccountRole.Arn 
+      Environment: 
+        Variables:          
+          kms_key: !Ref KMSKey 
+
+
+# Step 5:  CheckCopiedSnapshotStatus  
+# This option fetches the copy snapshot status and passes the response to IsCopySharedRDSSnapshotAvailable method
+  CheckCopiedSnapshotStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-CheckCopiedSnapshotStatus
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from operator import itemgetter
+
+          rds = boto3.client('rds')
+          def lambda_handler(event, context):
+              try:
+                  print('CheckCopiedSnapshotStatus function Event: {}'.format(event))
+                  targetDBSnapshotIdentifier = event['DBSnapshot']['TargetDBSnapshotIdentifier']
+                  print('targetdbSnapshotIdentifier::', targetDBSnapshotIdentifier)
+
+                  output =     {
+                      'targetDBSnapshot': {
+                          'TargetDBSnapshotIdentifier': targetDBSnapshotIdentifier,
+                          'status':'NotAvailable'
+                        }
+                      }
+                  
+                  response = rds.describe_db_snapshots(
+                      DBSnapshotIdentifier=targetDBSnapshotIdentifier
+                  )
+                  print("Response >> ",response)
+
+                  if not response['DBSnapshots']:
+                      return output
+                      
+                  if len(response['DBSnapshots'])>1:
+                      sorted_keys = sorted(response['DBSnapshots'], key=itemgetter('SnapshotCreateTime'), reverse=True)
+                      status = sorted_keys[0]['Status'] 
+                  else:
+                      status = response['DBSnapshots'][0]['Status'] 
+
+                  if status == 'available':
+                      return  {
+                          'DBSnapshot': {
+                              'TargetDBSnapshotIdentifier': targetDBSnapshotIdentifier,
+                              'status':'Available'
+                              }
+                          }
+                  else:
+                      return event
+              except Exception as e:
+                  print("error: {0}".format(e))
+                  return {'status':'NotAvailable'}
+      Description: 'This option fetches the copy snapshot status and passes the response to IsRDSCopySnapshotAvailable method'
+      MemorySize: 128
+      Timeout: 100
+      Role: !GetAtt LambdaTargetAccountRole.Arn
+
+# Step 6:  ReadSecretDBName
+  ReadSecretDBName:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-ReadSecretDBName
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3, json, os
+          import base64
+          from botocore.exceptions import ClientError
+
+          def get_secret():
+              secret_name = os.environ.get("secretname")
+              region_name = "us-east-1"
+
+              # Create a Secrets Manager client
+              session = boto3.session.Session()
+              client = session.client(
+                  service_name='secretsmanager',
+                  region_name=region_name
+              )
+
+              # In this sample we only handle the specific exceptions for the 'GetSecretValue' API.
+              # See https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
+              # We rethrow the exception by default.
+
+              try:
+                  get_secret_value_response = client.get_secret_value(
+                      SecretId=secret_name
+                  )
+                  # Decrypts secret using the associated KMS key.
+                  # Depending on whether the secret is a string or binary, one of these fields will be populated.
+                  if 'SecretString' in get_secret_value_response:
+                      secret = get_secret_value_response['SecretString']
+                      db_value=json.loads(secret)
+                      return(db_value)
+                  else:
+                      decoded_binary_secret = base64.b64decode(get_secret_value_response['SecretBinary'])
+                      db_value=json.loads(decoded_binary_secret)
+                      return(db_value)
+                  
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'DecryptionFailureException':
+                      # Secrets Manager can't decrypt the protected secret text using the provided KMS key.
+                      # Deal with the exception here, and/or rethrow at your discretion.
+                      raise e
+                  elif e.response['Error']['Code'] == 'InternalServiceErrorException':
+                      # An error occurred on the server side.
+                      # Deal with the exception here, and/or rethrow at your discretion.
+                      raise e
+                  elif e.response['Error']['Code'] == 'InvalidParameterException':
+                      # You provided an invalid value for a parameter.
+                      # Deal with the exception here, and/or rethrow at your discretion.
+                      raise e
+                  elif e.response['Error']['Code'] == 'InvalidRequestException':
+                      # You provided a parameter value that is not valid for the current state of the resource.
+                      # Deal with the exception here, and/or rethrow at your discretion.
+                      raise e
+                  elif e.response['Error']['Code'] == 'ResourceNotFoundException':
+                      # We can't find the resource that you asked for.
+                      # Deal with the exception here, and/or rethrow at your discretion.
+                      raise e
+              
+          def lambda_handler(event, context):
+              # TODO implement
+              print("Event is -->", event)
+              s=get_secret()
+              output = {
+                    'DBSnapshot': {
+                        'TargetDBSnapshotIdentifier': event['DBSnapshot']['TargetDBSnapshotIdentifier'],
+                        'status':'Available',
+                        'db_value': s
+                      }
+                    }
+              return(output)
+      Description: 'To find value of existing DB instance'
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt LambdaTargetAccountRole.Arn
+      Environment: 
+        Variables: 
+          engine : !Ref Engine
+          secretname : !Ref SecretName  
+
+
+# Step 7:  RestoreDBInstance        
+#This function will restore RDS instance from shared snapshot.
+  RestoreDBInstance:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-RestoreDBInstance
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+
+          rds = boto3.client('rds')
+
+          engine = os.environ.get("engine")
+          dbInstanceClass = os.environ.get("dbInstanceClass") 
+          subnetgroups = os.environ.get("subnetgroups")
+          securitygroupid = os.environ.get("securitygroupid")
+          databasename = os.environ.get("databasename")
+
+          def lambda_handler(event, context):
+              if event['DBSnapshot']['db_value']['db_prefix']:
+                  db_host_prefix_value = event['DBSnapshot']['db_value']['db_prefix']+"-"
+                  db_host=event['DBSnapshot']['db_value']['db_host']
+                  db_host_str = db_host.split(".",1)[0].split(db_host_prefix_value, maxsplit=1)
+                  print(db_host_str)
+                  db_version = int(db_host_str[1])
+              else:
+                  db_host_prefix_value=databasename+"-"
+                  db_version=0
+
+              DBInstanceIdentifier=db_host_prefix_value + str(db_version+1)
+              db_snapshot_identifier = event['DBSnapshot']['TargetDBSnapshotIdentifier']
+              print("Bring new instance", DBInstanceIdentifier ,"from snapshot ->", db_snapshot_identifier)
+              try:
+                  response=rds.restore_db_instance_from_db_snapshot(DBInstanceIdentifier=DBInstanceIdentifier,
+                                                              DBSnapshotIdentifier=db_snapshot_identifier,
+                                                              Engine=engine,                                                       
+                                                              DBInstanceClass=dbInstanceClass,
+                                                              DBSubnetGroupName=subnetgroups,
+                                                              VpcSecurityGroupIds=[securitygroupid],
+                                                              CopyTagsToSnapshot=True)
+                  print("Response >> ",response)
+                  return {"db_instance_identifier": DBInstanceIdentifier, "db_version": str(db_version+1) }
+              except Exception as e:
+                  print(e)
+                  raise e
+
+      Description: 'This function will restore RDS instance from shared snapshot.'
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt LambdaTargetAccountRole.Arn
+      Environment: 
+        Variables: 
+          engine : !Ref Engine
+          subnetgroups : !Ref Subnetgroups 
+          securitygroupid: !Ref SGID      
+          dbInstanceClass: !Ref DBInstanceClass
+          databasename: !Ref DatabaseName
+
+# Step 8:  FetchNewDBInstanceStatus
+#This function will fetch the restored RDS instance state, once available it will add instance in cluster.
+  FetchNewDBInstanceStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-FetchNewDBInstanceStatus
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from operator import itemgetter
+
+          def lambda_handler(event, context):
+              rds = boto3.client('rds')
+              db_instance_identifier = event["db_instance_identifier"]
+              print(event["db_instance_identifier"])
+              try:
+                  response = rds.describe_db_instances(
+                      DBInstanceIdentifier=db_instance_identifier
+                  )
+                  
+                  print("Response >> ",response)
+                  
+                  if not response['DBInstances']:
+                      return {'status':'NotAvailable','db_instance_identifier': event["db_instance_identifier"], "db_version": event["db_version"] }
+                      
+                  sorted_keys = sorted(response['DBInstances'], key=itemgetter('InstanceCreateTime'), reverse=True)
+                  status = sorted_keys[0]['DBInstanceStatus']
+                  
+                  if status == 'available':
+                      return {'status':'Available', 'db_instance_identifier': event["db_instance_identifier"], "db_version": event["db_version"] }
+                  else:
+                      return {'status':'NotAvailable','db_instance_identifier': event["db_instance_identifier"], "db_version": event["db_version"] }
+                  
+              except Exception as e:
+                  return {'status':'NotAvailable', "db_instance_identifier": event["db_instance_identifier"], "db_version": event["db_version"] }
+                  raise e
+      Description: 'This function will fetch the restored RDS instance state, once available it will add instance in cluster.'
+      MemorySize: 128
+      Timeout: 900
+      Role: !GetAtt LambdaTargetAccountRole.Arn
+
+# Step 8:  UpdateAWSSecret       
+#This function will swap the rds name with existing rds.
+  UpdateAWSSecret:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-UpdateAWSSecret
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import logging
+          import boto3, os
+          import json
+          import base64
+          from botocore.exceptions import ClientError
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create RDS client
+          rds = boto3.client('rds')
+              
+          def tag_instance(db_version,db_instance_identifier):
+              NoOfOlderInstances=os.environ.get("NoOfOlderInstances")
+              # Access the older DB instance and get the arn
+              
+              db_prefix=("".join(db_instance_identifier.rsplit(db_version)))
+              print(db_version,db_instance_identifier, db_prefix )
+              print("*******************************")
+              oldest_db_version=int(db_version)-int(NoOfOlderInstances)
+              print (oldest_db_version)
+              
+              if oldest_db_version < 0 :
+                  return (None)
+              else:
+                  oldest_db_instance_identifier=db_prefix+str(oldest_db_version)
+                  print(oldest_db_instance, oldest_db_instance_identifier)
+                  
+                  try:
+                      response = rds.describe_db_instances(
+                          DBInstanceIdentifier=oldest_db_instance_identifier
+                      )
+                      oldest_db_instance_arn=response["DBInstances"][0]["DBInstanceArn"]
+                      logger.info('### oldest_db_instance_arn ###')
+                      logger.info(oldest_db_instance_arn)
+                  
+                  # Tag the older RDS cluster
+                      response = rds.add_tags_to_resource(
+                      ResourceName=oldest_db_instance_arn,
+                      Tags=[
+                          {
+                              'Key': 'to-be-deleted',
+                              'Value': 'True'
+                          },
+                          ]
+                      )
+                      print("Got tagged -->",oldest_db_instance_arn)
+                      return(response)
+                  except ClientError as e:
+                      print("Older instance not found")
+                      raise e
+                  
+          def update_secret(db_instance_identifier):
+              secret_name = os.environ.get("secretname")
+              region_name = "us-east-1"
+
+              # Find the endpoint name of new cluster
+              try:
+                  response = rds.describe_db_instances(
+                      DBInstanceIdentifier=db_instance_identifier
+                  )
+                  endpoint=response["DBInstances"][0]["Endpoint"]["Address"]
+                  print("Endpoint name --->",endpoint)
+              except ClientError as e:
+                  raise e
+                  
+              # Create a Secrets Manager client
+              session = boto3.session.Session()
+              client = session.client(
+                  service_name='secretsmanager',
+                  region_name=region_name
+              )
+              try:
+                  get_secret_value_response = client.get_secret_value(
+                      SecretId=secret_name
+                  )
+                  if 'SecretString' in get_secret_value_response:
+                      secret = get_secret_value_response['SecretString']
+                      db_value=json.loads(secret)
+                  else:
+                      secret = base64.b64decode(get_secret_value_response['SecretBinary'])
+                      db_value=json.loads(decoded_binary_secret)
+                  
+                  updated_secret = json.loads(secret)
+                  updated_secret['db_host'] = endpoint
+                  response = client.update_secret(
+                    SecretId=secret_name,
+                    Description='RDS Instance name',
+                    SecretString=json.dumps(updated_secret, indent=4, sort_keys=True, default=str)
+                    )
+                  logger.info("Updated the Secret successfully")
+                  return (response)
+                  
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'DecryptionFailureException':
+                      # Secrets Manager can't decrypt the protected secret text using the provided KMS key.
+                      # Deal with the exception here, and/or rethrow at your discretion.
+                      raise e
+                  elif e.response['Error']['Code'] == 'InternalServiceErrorException':
+                      # An error occurred on the server side.
+                      # Deal with the exception here, and/or rethrow at your discretion.
+                      raise e
+                  elif e.response['Error']['Code'] == 'InvalidParameterException':
+                      # You provided an invalid value for a parameter.
+                      # Deal with the exception here, and/or rethrow at your discretion.
+                      raise e
+                  elif e.response['Error']['Code'] == 'InvalidRequestException':
+                      # You provided a parameter value that is not valid for the current state of the resource.
+                      # Deal with the exception here, and/or rethrow at your discretion.
+                      raise e
+                  elif (e.response['Error']['Code']) == 'ResourceNotFoundException':
+                      # We can't find the resource that you asked for.
+                      # Deal with the exception here, and/or rethrow at your discretion.
+                      raise e
+
+          def lambda_handler(event, context):
+              # TODO implement
+              db_instance_identifier = event["db_instance_identifier"]
+              db_version = event["db_version"]
+              s=update_secret(db_instance_identifier)
+              tag_instance(db_version,db_instance_identifier)
+              return(s)
+
+      Description: 'This function will swap the rds name with existing rds'
+      MemorySize: 128
+      Timeout: 900
+      Role: !GetAtt LambdaTargetAccountRole.Arn
+      Environment: 
+        Variables: 
+          secretname : !Ref SecretName 
+          NoOfOlderInstances : !Ref NoOfOlderInstances 
+
+# Step 9:  CleanOlderDBInstances       
+#This function will delete tagged rds instances.
+  CleanOlderDBInstances:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-CleanOlderDBInstances
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import logging
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def delete_db_instance(dbname):
+
+              # Create RDS client
+              rds = boto3.client('rds')
+
+              try:
+                  response = rds.delete_db_instance(
+                  DBInstanceIdentifier=dbname,
+                  SkipFinalSnapshot=True,
+                  DeleteAutomatedBackups=True
+                  )
+                  return(response)
+              except Exception as e:
+                  raise e
+
+          def lambda_handler(event, context):
+              # TODO implement
+
+              client = boto3.client('resourcegroupstaggingapi')
+              
+              try: 
+                  response = client.get_resources(
+                  PaginationToken='',
+                  TagFilters=[
+                      {
+                          'Key': 'to-be-deleted',
+                          'Values': [
+                              'True',
+                          ]
+                      },
+                  ],
+                  ResourcesPerPage=20,
+                  ResourceTypeFilters=[
+                      'rds:db',
+                  ],
+                  IncludeComplianceDetails=False,
+                  ExcludeCompliantResources=False
+                  )
+                  print(json.dumps(response,indent=4))
+              except Exception as e:
+                  raise e
+
+              for instance in response["ResourceTagMappingList"]:
+                  dbname=instance["ResourceARN"][38:]
+                  logger.info(dbname)
+                  s=delete_db_instance(dbname)
+                  logger.info(s)
+      Description: 'This function will delete tagged rds instances'
+      MemorySize: 128
+      Timeout: 900
+      Role: !GetAtt LambdaTargetAccountRole.Arn
+
+  StepFunctionLambdaExecutinRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: InvokeCallbackLambda
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - "*"
+
+  TargetAccountTargetRegionRDSRestoreWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+        StateMachineName: !Sub ${AWS::StackName}-CrossAccount-RDSSync-Target_Account
+        DefinitionString:
+          !Sub
+            - |-
+              {
+                "StartAt": "CheckSourceSnapshotStatus",
+                "States": {
+                  "CheckSourceSnapshotStatus": {
+                    "Type": "Task",
+                    "Resource": "${CheckSourceSnapshotStatus.Arn}",
+                    "Next": "IsSourceSnapshotAvailable"
+                  },
+                  "IsSourceSnapshotAvailable": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.DBSnapshot.status",
+                        "StringEquals": "Available",
+                        "Next": "CopySharedSnapshotInTargetAccount"
+                      },
+                      {
+                        "Variable": "$.DBSnapshot.status",
+                        "StringEquals": "NotAvailable",
+                        "Next": "WaitXMins"
+                      }
+                    ]
+                  },
+                  "WaitXMins": {
+                    "Type": "Wait",
+                    "Seconds": 300,
+                    "Next": "CheckSourceSnapshotStatus"
+                  },
+                  "CopySharedSnapshotInTargetAccount": {
+                    "Type": "Task",
+                    "Resource": "${CopySharedSnapshot.Arn}",
+                    "Next": "CheckCopiedSnapshotStatus"
+                  },
+                  "CheckCopiedSnapshotStatus": {
+                    "Type": "Task",
+                    "Resource": "${CheckCopiedSnapshotStatus.Arn}",
+                    "Next": "IsCopySharedSnapshotAvailable" 
+                  },
+                  "IsCopySharedSnapshotAvailable": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.DBSnapshot.status",
+                        "StringEquals": "Available",
+                        "Next": "ReadExistingDBName"
+                      },
+                      {
+                        "Variable": "$.DBSnapshot.status",
+                        "StringEquals": "NotAvailable",
+                        "Next": "WaitXMinsForNewSnapshotAvailability"
+                      }
+                    ]
+                  },
+                  "WaitXMinsForNewSnapshotAvailability": {
+                    "Type": "Wait",
+                    "Seconds": 300,
+                    "Next": "CheckCopiedSnapshotStatus"
+                  },
+                  "ReadExistingDBName": {
+                    "Type": "Task",
+                    "Resource": "${ReadSecretDBName.Arn}",
+                    "Next": "RestoreDBInstance"
+                  },
+                  "RestoreDBInstance": {
+                    "Type": "Task",
+                    "Resource": "${RestoreDBInstance.Arn}",
+                    "Next": "FetchNewDBInstanceStatus"
+                  },
+                  "FetchNewDBInstanceStatus": {
+                    "Type": "Task",
+                    "Resource": "${FetchNewDBInstanceStatus.Arn}",
+                    "Next": "IsNewRDSInstanceAvailable"
+                  },
+                  "IsNewRDSInstanceAvailable": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.status",
+                        "StringEquals": "NotAvailable",
+                        "Next": "WaitXMinsForNewRDSInstanceAvailability"
+                      },
+                      {
+                        "Variable": "$.status",
+                        "StringEquals": "Available",
+                        "Next": "UpdateSecretWithDBValue"
+                      }
+                    ]
+                  },
+                  "WaitXMinsForNewRDSInstanceAvailability": {
+                    "Type": "Wait",
+                    "Seconds": 500,
+                    "Next": "FetchNewDBInstanceStatus"
+                  },
+                  "UpdateSecretWithDBValue": {
+                    "Type": "Task",
+                    "Resource": "${UpdateAWSSecret.Arn}",
+                    "Next": "CleanOlderDBInstances"
+                  },
+                  "CleanOlderDBInstances": {
+                    "Type": "Task",
+                    "Resource": "${CleanOlderDBInstances.Arn}",
+                    "End": true
+                  }
+                }
+              }
+
+            - {RestoreDBInstanceArn: !GetAtt [ RestoreDBInstance, Arn ]}
+        RoleArn: !GetAtt StepFunctionLambdaExecutinRole.Arn
