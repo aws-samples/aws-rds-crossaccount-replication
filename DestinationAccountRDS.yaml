@@ -597,7 +597,7 @@ Resources:
                   return (None)
               else:
                   oldest_db_instance_identifier=db_prefix+str(oldest_db_version)
-                  print(oldest_db_instance, oldest_db_instance_identifier)
+                  print(oldest_db_instance_identifier)
                   
                   try:
                       response = rds.describe_db_instances(
@@ -620,11 +620,11 @@ Resources:
                       print("Got tagged -->",oldest_db_instance_arn)
                       return(response)
                   except ClientError as e:
-                      print("Older instance not found")
-                      raise e
+                      print("Older instance not found",e)
                   
           def update_secret(db_instance_identifier):
               secret_name = os.environ.get("secretname")
+              db_prefix = os.environ.get("databasename")
               region_name = "us-east-1"
 
               # Find the endpoint name of new cluster
@@ -656,6 +656,7 @@ Resources:
                   
                   updated_secret = json.loads(secret)
                   updated_secret['db_host'] = endpoint
+                  updated_secret['db_prefix'] = db_prefix
                   response = client.update_secret(
                     SecretId=secret_name,
                     Description='RDS Instance name',
@@ -702,6 +703,7 @@ Resources:
         Variables: 
           secretname : !Ref SecretName 
           NoOfOlderInstances : !Ref NoOfOlderInstances 
+          databasename: !Ref DatabaseName
 
 # Step 9:  CleanOlderDBInstances       
 #This function will delete tagged rds instances.
@@ -891,7 +893,7 @@ Resources:
                   },
                   "WaitXMinsForNewRDSInstanceAvailability": {
                     "Type": "Wait",
-                    "Seconds": 500,
+                    "Seconds": 300,
                     "Next": "FetchNewDBInstanceStatus"
                   },
                   "UpdateSecretWithDBValue": {
