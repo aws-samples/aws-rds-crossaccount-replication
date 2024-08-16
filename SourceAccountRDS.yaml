@@ -10,9 +10,10 @@ Parameters:
     Default: 'source-database-1'
 
   KMSKey:
-    Description: Arn of Cross Account KMS Key that is shared with destination account
-    Type: String 
-    Default: 'arn:aws:kms:us-east-1:299344511603:key/45aaac81-ccfa-4c4b-b197-95fe6c40c93a'
+    Description: Arn of Cross Account KMS Key that is shared with destination account e.g. arn:aws:kms:us-east-1:123456789012:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    Type: String
+    MinLength: 20
+    MaxLength: 2048
   
   SourceDBSnapshotName:
     Description: Name of the Snapshot
@@ -20,9 +21,9 @@ Parameters:
     Default: 'source-database-snapshot'
   
   DestinationAccountNumber: 
-    Description: Destination Account Number 
+    Description: Destination Account Number e.g. 123456789012
     Type: String
-    Default: 285731477250
+    MinLength: 12
   
   ScheduleExpression:
     Type: String 

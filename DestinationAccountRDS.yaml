@@ -8,15 +8,19 @@ Parameters:
     Type: String
     Description: Engine Type
     Default: 'postgres'
+    MinLength: 1
+    MaxLength: 32
 
   DBInstanceClass:
     Type: String
     Description: DB Instance Class
     Default: 'db.m6i.large'
+    MinLength: 1
+    MaxLength: 32
 
   Subnetgroups:
     Type: String 
-    Description: VPC SubnetGroups where RDS will be restored in
+    Description: VPC SubnetGroups where RDS will be restored in (Optional or it will create onde)
     Default: "rds-xxx-xxxxxx"
 
   DatabaseName:
@@ -31,13 +35,13 @@ Parameters:
 
   SGID:
     Type: String 
-    Description: Security group for destination cluster. Please ensure that port 5432 open     
-    Default: "sg-xxxxxxxxxxxxx"   
+    Description: Security group for destination cluster. Please ensure that port 5432 open 
 
   KMSKey:
-    Description: Arn of KMS Key to encrypt your snapshot in destination account. Check Pre-requisite 4.
+    Description: Arn of KMS Key to encrypt your snapshot in destination account arn:aws:kms:us-east-1:123456789012:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (Ref Pre-requisite 4)
     Type: String 
-    Default: 'arn:aws:kms:us-east-1:1111111111111:key/e575ff8f-47a0-4b1e-ab03-5999f287a1af'
+    MinLength: 20
+    MaxLength: 2048
 
   NoOfOlderInstances:
     Description: Number of older instances that you want to keep for roll back
