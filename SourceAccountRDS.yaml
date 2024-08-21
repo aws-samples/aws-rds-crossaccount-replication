@@ -223,7 +223,7 @@ Resources:
           import os
           
           kms_key=os.environ.get("kms_key")
-          target_db_snapshot_identifier = os.environ.get("db_snapshot_identifier")+'-copy-in-'+target_region 
+          target_db_snapshot_identifier = os.environ.get("db_snapshot_identifier")+'-copy-in' 
           
           rds = boto3.client('rds')     
 
